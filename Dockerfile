@@ -16,7 +16,7 @@ COPY . .
 RUN go build -o main .
 
 # Final stage
-FROM alpine:latest
+FROM alpine:3.19
 
 WORKDIR /root/
 
