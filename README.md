@@ -56,13 +56,42 @@ Run the container:
 docker run -p 8080:8080 no-weak-links:latest
 ```
 
-## GitHub Actions Workflow
+## GitHub Actions Workflows
 
-The repository includes a CI/CD workflow (`.github/workflows/build-and-push.yml`) that:
+The repository includes two CI/CD workflows:
+
+### Build and Push (`.github/workflows/build-and-push.yml`)
+
+This workflow:
 
 1. Builds the Docker image
 2. Pushes to Azure Container Registry
 3. Generates build attestation for provenance tracking
+
+**Triggers:**
+- Push to `main` branch
+- Push to branches matching `copilot/**`
+- Pull requests to `main` branch
+- Manual trigger via `workflow_dispatch`
+
+### Deploy (`.github/workflows/deploy.yml`)
+
+This workflow:
+
+1. Pulls the image from Azure Container Registry
+2. **Verifies image provenance using GitHub CLI** (`gh attestation verify`)
+3. Deploys to Azure Kubernetes Service (AKS)
+
+**Triggers:**
+- Automatically after successful completion of the build-and-push workflow on `main` branch
+- Manual trigger via `workflow_dispatch` (allows specifying a custom image tag)
+
+**Key Features:**
+- Uses `gh attestation verify` command to verify the image provenance before deployment
+- Deploys only images with verified attestations
+- Supports both automatic and manual deployment modes
+- Creates Kubernetes Deployment with 2 replicas
+- Exposes application via LoadBalancer service
 
 ### Required Secrets
 
@@ -71,14 +100,10 @@ Configure the following secrets in your GitHub repository:
 - `ACR_REGISTRY` - Your Azure Container Registry URL (e.g., `myregistry.azurecr.io`)
 - `ACR_USERNAME` - Azure Container Registry username
 - `ACR_PASSWORD` - Azure Container Registry password
-
-### Workflow Triggers
-
-The workflow runs on:
-- Push to `main` branch
-- Push to branches matching `copilot/**`
-- Pull requests to `main` branch
-- Manual trigger via `workflow_dispatch`
+- `AZURE_CREDENTIALS` - Azure service principal credentials (JSON format)
+- `AZURE_RESOURCE_GROUP` - Azure resource group name for deployment
+- `AKS_CLUSTER_NAME` - Azure Kubernetes Service cluster name
+- `AKS_NAMESPACE` - (Optional) Kubernetes namespace for deployment (defaults to `default`)
 
 ## Intentionally Vulnerable Dependencies
 

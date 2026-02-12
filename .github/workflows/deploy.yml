@@ -1,0 +1,274 @@
+name: Deploy to Azure Kubernetes Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g., main-abc1234)'
+        required: true
+        type: string
+  workflow_run:
+    workflows: ["Build and Push to Azure Container Registry"]
+    types:
+      - completed
+    branches:
+      - main
+
+env:
+  REGISTRY: ${{ secrets.ACR_REGISTRY }}
+  IMAGE_NAME: no-weak-links
+  AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+  AKS_NAMESPACE: ${{ secrets.AKS_NAMESPACE || 'default' }}
+  DEPLOYMENT_NAME: no-weak-links
+  RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: read
+
+jobs:
+  verify-and-deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: set-tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
+          else
+            # For workflow_run trigger, use the full SHA from the triggering workflow
+            # Note: head_sha provides the full commit SHA
+            COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+            echo "IMAGE_TAG=main-${COMMIT_SHA}" >> $GITHUB_ENV
+          fi
+          echo "Image tag set to: ${IMAGE_TAG}"
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Pull image to get digest
+        id: pull-image
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "Pulling image: $IMAGE_REF"
+          docker pull "$IMAGE_REF"
+          
+          # Get the image digest
+          IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d'@' -f2)
+          
+          # Verify digest is not empty
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "❌ Failed to extract image digest"
+            exit 1
+          fi
+          
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
+          echo "Image digest: $IMAGE_DIGEST"
+
+      - name: Verify image provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Verifying provenance for image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}"
+          
+          # Verify the attestation using GitHub CLI
+          gh attestation verify oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }} \
+            --owner ${{ github.repository_owner }}
+          
+          echo "✅ Provenance verification successful!"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup AKS context
+        run: |
+          # Get AKS credentials
+          az aks get-credentials \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace ${{ env.AKS_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create or update ACR secret
+        run: |
+          # Create or update the docker registry secret for pulling images
+          kubectl create secret docker-registry acr-secret \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "✅ ACR secret configured"
+
+      - name: Deploy to Azure Kubernetes Service
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}"
+          
+          echo "Deploying verified image to AKS: $IMAGE_REF"
+          
+          # Create or update the deployment
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.DEPLOYMENT_NAME }}
+            namespace: ${{ env.AKS_NAMESPACE }}
+            labels:
+              app: ${{ env.DEPLOYMENT_NAME }}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${{ env.DEPLOYMENT_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.DEPLOYMENT_NAME }}
+              spec:
+                containers:
+                - name: ${{ env.DEPLOYMENT_NAME }}
+                  image: $IMAGE_REF
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                  env:
+                  - name: PORT
+                    value: "8080"
+                  resources:
+                    requests:
+                      cpu: 250m
+                      memory: 512Mi
+                    limits:
+                      cpu: 500m
+                      memory: 1Gi
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                imagePullSecrets:
+                - name: acr-secret
+          EOF
+          
+          # Create or update the service
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.DEPLOYMENT_NAME }}
+            namespace: ${{ env.AKS_NAMESPACE }}
+          spec:
+            type: LoadBalancer
+            selector:
+              app: ${{ env.DEPLOYMENT_NAME }}
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8080
+          EOF
+          
+          echo "✅ Deployment manifests applied successfully"
+
+      - name: Wait for deployment rollout
+        run: |
+          echo "Waiting for deployment to complete..."
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            --timeout=5m
+          
+          echo "✅ Deployment rolled out successfully"
+
+      - name: Get deployment URL
+        run: |
+          echo "Waiting for LoadBalancer IP assignment..."
+          
+          # Wait for external IP to be assigned
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            EXTERNAL_IP=$(kubectl get service ${{ env.DEPLOYMENT_NAME }} \
+              --namespace=${{ env.AKS_NAMESPACE }} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            
+            if [ -n "$EXTERNAL_IP" ] && [ "$EXTERNAL_IP" != "null" ]; then
+              echo "🚀 Application deployed successfully!"
+              echo "📍 URL: http://${EXTERNAL_IP}"
+              echo "deployment_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+              break
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Waiting for external IP (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+              sleep 10
+            fi
+          done
+          
+          if [ -z "$EXTERNAL_IP" ] || [ "$EXTERNAL_IP" = "null" ]; then
+            echo "⚠️ External IP not assigned yet. Check service status manually."
+            kubectl get service ${{ env.DEPLOYMENT_NAME }} --namespace=${{ env.AKS_NAMESPACE }}
+          fi
+
+      - name: Verify deployment health
+        run: |
+          # Get the external IP
+          EXTERNAL_IP=$(kubectl get service ${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          if [ -z "$EXTERNAL_IP" ] || [ "$EXTERNAL_IP" = "null" ]; then
+            echo "⚠️ Cannot perform health check - no external IP assigned"
+            exit 0
+          fi
+          
+          echo "Testing health endpoint at http://${EXTERNAL_IP}/health"
+          
+          # Retry health check with timeout
+          MAX_ATTEMPTS=10
+          ATTEMPT=0
+          SLEEP_TIME=10
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Health check attempt $ATTEMPT of $MAX_ATTEMPTS..."
+            
+            if curl -f -s "http://${EXTERNAL_IP}/health" > /dev/null 2>&1; then
+              echo "✅ Health check successful!"
+              curl "http://${EXTERNAL_IP}/health"
+              exit 0
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Health check failed, waiting ${SLEEP_TIME}s before retry..."
+              sleep $SLEEP_TIME
+            fi
+          done
+          
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+          echo "Checking pod status..."
+          kubectl get pods --namespace=${{ env.AKS_NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }}
+          exit 1
