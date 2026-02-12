@@ -92,12 +92,8 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Azure Kubernetes Service
+      - name: Setup AKS context
         run: |
-          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}"
-          
-          echo "Deploying verified image to AKS: $IMAGE_REF"
-          
           # Get AKS credentials
           az aks get-credentials \
             --resource-group ${{ env.RESOURCE_GROUP }} \
@@ -106,6 +102,24 @@ jobs:
           
           # Create namespace if it doesn't exist
           kubectl create namespace ${{ env.AKS_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create or update ACR secret
+        run: |
+          # Create or update the docker registry secret for pulling images
+          kubectl create secret docker-registry acr-secret \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "✅ ACR secret configured"
+
+      - name: Deploy to Azure Kubernetes Service
+        run: |
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}"
+          
+          echo "Deploying verified image to AKS: $IMAGE_REF"
           
           # Create or update the deployment
           cat <<EOF | kubectl apply -f -
@@ -176,18 +190,6 @@ jobs:
           EOF
           
           echo "✅ Deployment manifests applied successfully"
-
-      - name: Create or update ACR secret
-        run: |
-          # Create or update the docker registry secret for pulling images
-          kubectl create secret docker-registry acr-secret \
-            --namespace=${{ env.AKS_NAMESPACE }} \
-            --docker-server=${{ env.REGISTRY }} \
-            --docker-username=${{ secrets.ACR_USERNAME }} \
-            --docker-password=${{ secrets.ACR_PASSWORD }} \
-            --dry-run=client -o yaml | kubectl apply -f -
-          
-          echo "✅ ACR secret configured"
 
       - name: Wait for deployment rollout
         run: |
