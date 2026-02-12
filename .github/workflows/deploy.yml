@@ -41,8 +41,8 @@ jobs:
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
           else
-            # For workflow_run trigger, use the latest tag from main branch
-            echo "IMAGE_TAG=main-${{ github.sha }}" >> $GITHUB_ENV
+            # For workflow_run trigger, use the SHA from the triggering workflow
+            echo "IMAGE_TAG=main-${{ github.event.workflow_run.head_sha }}" >> $GITHUB_ENV
           fi
           echo "Image tag set to: $IMAGE_TAG"
 
@@ -88,6 +88,20 @@ jobs:
           
           echo "Deploying verified image: $IMAGE_REF"
           
+          # Check if container group exists and delete it to ensure fresh deployment
+          if az container show \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.CONTAINER_GROUP_NAME }} &>/dev/null; then
+            echo "Existing container found, deleting..."
+            az container delete \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name ${{ env.CONTAINER_GROUP_NAME }} \
+              --yes
+            echo "Waiting for deletion to complete..."
+            sleep 10
+          fi
+          
+          # Create new container with verified image
           az container create \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.CONTAINER_GROUP_NAME }} \
@@ -101,10 +115,7 @@ jobs:
             --memory 1 \
             --restart-policy OnFailure \
             --environment-variables \
-              PORT=8080 \
-            || az container restart \
-              --resource-group ${{ env.RESOURCE_GROUP }} \
-              --name ${{ env.CONTAINER_GROUP_NAME }}
+              PORT=8080
 
       - name: Get deployment URL
         run: |
@@ -127,7 +138,27 @@ jobs:
             --output tsv)
           
           echo "Waiting for container to be ready..."
-          sleep 30
           
-          echo "Testing health endpoint..."
-          curl -f "http://${FQDN}:8080/health" || echo "⚠️ Health check failed, container may still be starting"
+          # Retry health check with timeout
+          MAX_ATTEMPTS=10
+          ATTEMPT=0
+          SLEEP_TIME=10
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "Health check attempt $ATTEMPT of $MAX_ATTEMPTS..."
+            
+            if curl -f -s "http://${FQDN}:8080/health" > /dev/null 2>&1; then
+              echo "✅ Health check successful!"
+              curl "http://${FQDN}:8080/health"
+              exit 0
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Health check failed, waiting ${SLEEP_TIME}s before retry..."
+              sleep $SLEEP_TIME
+            fi
+          done
+          
+          echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+          exit 1
