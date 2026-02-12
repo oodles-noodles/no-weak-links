@@ -1,4 +1,4 @@
-name: Deploy to Azure Container Instances
+name: Deploy to Azure Kubernetes Service
 
 on:
   workflow_dispatch:
@@ -17,9 +17,10 @@ on:
 env:
   REGISTRY: ${{ secrets.ACR_REGISTRY }}
   IMAGE_NAME: no-weak-links
-  CONTAINER_GROUP_NAME: no-weak-links-app
+  AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+  AKS_NAMESPACE: ${{ secrets.AKS_NAMESPACE || 'default' }}
+  DEPLOYMENT_NAME: no-weak-links
   RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
-  LOCATION: ${{ secrets.AZURE_LOCATION || 'eastus' }}
 
 permissions:
   contents: read
@@ -91,78 +92,158 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Azure Container Instances
+      - name: Deploy to Azure Kubernetes Service
         run: |
           IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ env.IMAGE_DIGEST }}"
           
-          echo "Deploying verified image: $IMAGE_REF"
+          echo "Deploying verified image to AKS: $IMAGE_REF"
           
-          # Check if container group exists and delete it to ensure fresh deployment
-          if az container show \
+          # Get AKS credentials
+          az aks get-credentials \
             --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_GROUP_NAME }} &>/dev/null; then
-            echo "Existing container found, deleting..."
-            az container delete \
-              --resource-group ${{ env.RESOURCE_GROUP }} \
-              --name ${{ env.CONTAINER_GROUP_NAME }} \
-              --yes
-            
-            # Wait for deletion to complete
-            echo "Waiting for deletion to complete..."
-            MAX_WAIT=60
-            ELAPSED=0
-            while [ $ELAPSED -lt $MAX_WAIT ]; do
-              if ! az container show \
-                --resource-group ${{ env.RESOURCE_GROUP }} \
-                --name ${{ env.CONTAINER_GROUP_NAME }} &>/dev/null; then
-                echo "Container deleted successfully"
-                break
-              fi
-              sleep 5
-              ELAPSED=$((ELAPSED + 5))
-            done
-          fi
+            --name ${{ env.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
           
-          # Create new container with verified image
-          # Use a stable DNS name for consistent access
-          DNS_LABEL="no-weak-links-app"
+          # Create namespace if it doesn't exist
+          kubectl create namespace ${{ env.AKS_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           
-          az container create \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_GROUP_NAME }} \
-            --image "$IMAGE_REF" \
-            --registry-login-server ${{ env.REGISTRY }} \
-            --registry-username ${{ secrets.ACR_USERNAME }} \
-            --registry-password ${{ secrets.ACR_PASSWORD }} \
-            --dns-name-label "$DNS_LABEL" \
-            --ports 8080 \
-            --cpu 1 \
-            --memory 1 \
-            --restart-policy OnFailure \
-            --environment-variables \
-              PORT=8080
+          # Create or update the deployment
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.DEPLOYMENT_NAME }}
+            namespace: ${{ env.AKS_NAMESPACE }}
+            labels:
+              app: ${{ env.DEPLOYMENT_NAME }}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${{ env.DEPLOYMENT_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.DEPLOYMENT_NAME }}
+              spec:
+                containers:
+                - name: ${{ env.DEPLOYMENT_NAME }}
+                  image: $IMAGE_REF
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                  env:
+                  - name: PORT
+                    value: "8080"
+                  resources:
+                    requests:
+                      cpu: 250m
+                      memory: 512Mi
+                    limits:
+                      cpu: 500m
+                      memory: 1Gi
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                imagePullSecrets:
+                - name: acr-secret
+          EOF
+          
+          # Create or update the service
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.DEPLOYMENT_NAME }}
+            namespace: ${{ env.AKS_NAMESPACE }}
+          spec:
+            type: LoadBalancer
+            selector:
+              app: ${{ env.DEPLOYMENT_NAME }}
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8080
+          EOF
+          
+          echo "✅ Deployment manifests applied successfully"
+
+      - name: Create or update ACR secret
+        run: |
+          # Create or update the docker registry secret for pulling images
+          kubectl create secret docker-registry acr-secret \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "✅ ACR secret configured"
+
+      - name: Wait for deployment rollout
+        run: |
+          echo "Waiting for deployment to complete..."
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            --timeout=5m
+          
+          echo "✅ Deployment rolled out successfully"
 
       - name: Get deployment URL
         run: |
-          FQDN=$(az container show \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_GROUP_NAME }} \
-            --query ipAddress.fqdn \
-            --output tsv)
+          echo "Waiting for LoadBalancer IP assignment..."
           
-          echo "🚀 Application deployed successfully!"
-          echo "📍 URL: http://${FQDN}:8080"
-          echo "deployment_url=http://${FQDN}:8080" >> $GITHUB_OUTPUT
+          # Wait for external IP to be assigned
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            EXTERNAL_IP=$(kubectl get service ${{ env.DEPLOYMENT_NAME }} \
+              --namespace=${{ env.AKS_NAMESPACE }} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            
+            if [ -n "$EXTERNAL_IP" ] && [ "$EXTERNAL_IP" != "null" ]; then
+              echo "🚀 Application deployed successfully!"
+              echo "📍 URL: http://${EXTERNAL_IP}"
+              echo "deployment_url=http://${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+              break
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Waiting for external IP (attempt $ATTEMPT/$MAX_ATTEMPTS)..."
+              sleep 10
+            fi
+          done
+          
+          if [ -z "$EXTERNAL_IP" ] || [ "$EXTERNAL_IP" = "null" ]; then
+            echo "⚠️ External IP not assigned yet. Check service status manually."
+            kubectl get service ${{ env.DEPLOYMENT_NAME }} --namespace=${{ env.AKS_NAMESPACE }}
+          fi
 
       - name: Verify deployment health
         run: |
-          FQDN=$(az container show \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --name ${{ env.CONTAINER_GROUP_NAME }} \
-            --query ipAddress.fqdn \
-            --output tsv)
+          # Get the external IP
+          EXTERNAL_IP=$(kubectl get service ${{ env.DEPLOYMENT_NAME }} \
+            --namespace=${{ env.AKS_NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           
-          echo "Waiting for container to be ready..."
+          if [ -z "$EXTERNAL_IP" ] || [ "$EXTERNAL_IP" = "null" ]; then
+            echo "⚠️ Cannot perform health check - no external IP assigned"
+            exit 0
+          fi
+          
+          echo "Testing health endpoint at http://${EXTERNAL_IP}/health"
           
           # Retry health check with timeout
           MAX_ATTEMPTS=10
@@ -173,9 +254,9 @@ jobs:
             ATTEMPT=$((ATTEMPT + 1))
             echo "Health check attempt $ATTEMPT of $MAX_ATTEMPTS..."
             
-            if curl -f -s "http://${FQDN}:8080/health" > /dev/null 2>&1; then
+            if curl -f -s "http://${EXTERNAL_IP}/health" > /dev/null 2>&1; then
               echo "✅ Health check successful!"
-              curl "http://${FQDN}:8080/health"
+              curl "http://${EXTERNAL_IP}/health"
               exit 0
             fi
             
@@ -186,4 +267,6 @@ jobs:
           done
           
           echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+          echo "Checking pod status..."
+          kubectl get pods --namespace=${{ env.AKS_NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }}
           exit 1

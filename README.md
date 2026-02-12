@@ -80,7 +80,7 @@ This workflow:
 
 1. Pulls the image from Azure Container Registry
 2. **Verifies image provenance using GitHub CLI** (`gh attestation verify`)
-3. Deploys to Azure Container Instances
+3. Deploys to Azure Kubernetes Service (AKS)
 
 **Triggers:**
 - Automatically after successful completion of the build-and-push workflow on `main` branch
@@ -90,6 +90,8 @@ This workflow:
 - Uses `gh attestation verify` command to verify the image provenance before deployment
 - Deploys only images with verified attestations
 - Supports both automatic and manual deployment modes
+- Creates Kubernetes Deployment with 2 replicas
+- Exposes application via LoadBalancer service
 
 ### Required Secrets
 
@@ -100,7 +102,8 @@ Configure the following secrets in your GitHub repository:
 - `ACR_PASSWORD` - Azure Container Registry password
 - `AZURE_CREDENTIALS` - Azure service principal credentials (JSON format)
 - `AZURE_RESOURCE_GROUP` - Azure resource group name for deployment
-- `AZURE_LOCATION` - (Optional) Azure region for deployment (defaults to `eastus`)
+- `AKS_CLUSTER_NAME` - Azure Kubernetes Service cluster name
+- `AKS_NAMESPACE` - (Optional) Kubernetes namespace for deployment (defaults to `default`)
 
 ## Intentionally Vulnerable Dependencies
 
