@@ -1,0 +1,7 @@
+# Configuration for Dependabot to automatically create PRs for GitHub Actions updates
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
