@@ -41,10 +41,12 @@ jobs:
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_ENV
           else
-            # For workflow_run trigger, use the SHA from the triggering workflow
-            echo "IMAGE_TAG=main-${{ github.event.workflow_run.head_sha }}" >> $GITHUB_ENV
+            # For workflow_run trigger, use the full SHA from the triggering workflow
+            # Note: head_sha provides the full commit SHA
+            COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
+            echo "IMAGE_TAG=main-${COMMIT_SHA}" >> $GITHUB_ENV
           fi
-          echo "Image tag set to: $IMAGE_TAG"
+          echo "Image tag set to: ${IMAGE_TAG}"
 
       - name: Log in to Azure Container Registry
         uses: docker/login-action@v3
@@ -62,6 +64,13 @@ jobs:
           
           # Get the image digest
           IMAGE_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_REF" | cut -d'@' -f2)
+          
+          # Verify digest is not empty
+          if [ -z "$IMAGE_DIGEST" ]; then
+            echo "❌ Failed to extract image digest"
+            exit 1
+          fi
+          
           echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
           echo "Image digest: $IMAGE_DIGEST"
 
@@ -97,11 +106,27 @@ jobs:
               --resource-group ${{ env.RESOURCE_GROUP }} \
               --name ${{ env.CONTAINER_GROUP_NAME }} \
               --yes
+            
+            # Wait for deletion to complete
             echo "Waiting for deletion to complete..."
-            sleep 10
+            MAX_WAIT=60
+            ELAPSED=0
+            while [ $ELAPSED -lt $MAX_WAIT ]; do
+              if ! az container show \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --name ${{ env.CONTAINER_GROUP_NAME }} &>/dev/null; then
+                echo "Container deleted successfully"
+                break
+              fi
+              sleep 5
+              ELAPSED=$((ELAPSED + 5))
+            done
           fi
           
           # Create new container with verified image
+          # Use a stable DNS name for consistent access
+          DNS_LABEL="no-weak-links-app"
+          
           az container create \
             --resource-group ${{ env.RESOURCE_GROUP }} \
             --name ${{ env.CONTAINER_GROUP_NAME }} \
@@ -109,7 +134,7 @@ jobs:
             --registry-login-server ${{ env.REGISTRY }} \
             --registry-username ${{ secrets.ACR_USERNAME }} \
             --registry-password ${{ secrets.ACR_PASSWORD }} \
-            --dns-name-label no-weak-links-${{ github.run_number }} \
+            --dns-name-label "$DNS_LABEL" \
             --ports 8080 \
             --cpu 1 \
             --memory 1 \
