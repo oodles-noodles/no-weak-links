@@ -71,6 +71,7 @@ jobs:
 
       - name: Deploy with Helm
         run: |
+          kubelogin
           helm upgrade --install no-weak-links ./helm/no-weak-links \
             --set image.repository="${{ vars.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}" \
             --set image.tag="${{ steps.image.outputs.tag }}" \
