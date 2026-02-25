@@ -53,6 +53,9 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: List files in build context
+        run: find . -not -path './.git/*' | sort
+
       - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@v6
