@@ -56,12 +56,6 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v4
 
-      - name: Set AKS context
-        uses: azure/aks-set-context@v4
-        with:
-          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
-          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
-
       - uses: azure/setup-kubectl@v4
 
       - name: Install kubelogin
@@ -69,9 +63,15 @@ jobs:
         with:
           kubelogin-version: 'v0.0.24'
 
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+     
       - name: Deploy with Helm
         run: |
-          kubelogin
+          # kubelogin convert-kubeconfig -l azurecli
           helm upgrade --install no-weak-links ./helm/no-weak-links \
             --set image.repository="${{ vars.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}" \
             --set image.tag="${{ steps.image.outputs.tag }}" \
