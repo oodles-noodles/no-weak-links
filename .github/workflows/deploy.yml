@@ -64,6 +64,9 @@ jobs:
 
       - uses: azure/setup-kubectl@v4
 
+      - name: Install kubelogin
+        uses: azure/use-kubelogin@v1
+
       - name: Deploy with Helm
         run: |
           helm upgrade --install no-weak-links ./helm/no-weak-links \
