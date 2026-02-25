@@ -12,6 +12,7 @@ permissions:
   contents: read
   id-token: write
   deployments: write
+  artifact-metadata: write
 
 env:
   REGISTRY: ${{ vars.ACR_REGISTRY }}
@@ -61,21 +62,7 @@ jobs:
           resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
           cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
 
-      - name: Create GitHub deployment record
-        id: deployment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const result = await github.rest.repos.createDeployment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: '${{ github.event.workflow_run.head_sha }}',
-              environment: 'production',
-              description: 'Deploy to AKS via Helm',
-              auto_merge: false,
-              required_contexts: []
-            });
-            return result.data.id;
+      - uses: azure/setup-kubectl@v4
 
       - name: Deploy with Helm
         run: |
@@ -84,30 +71,4 @@ jobs:
             --set image.tag="${{ steps.image.outputs.tag }}" \
             --wait
 
-      - name: Update deployment status to success
-        if: success()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              deployment_id: ${{ steps.deployment.outputs.result }},
-              state: 'success',
-              environment: 'production',
-              description: 'Deployment succeeded'
-            });
-
-      - name: Update deployment status to failure
-        if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              deployment_id: ${{ steps.deployment.outputs.result }},
-              state: 'failure',
-              environment: 'production',
-              description: 'Deployment failed'
-            });
+      
