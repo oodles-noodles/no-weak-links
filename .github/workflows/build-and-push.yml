@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: ${{ secrets.ACR_REGISTRY }}
+  REGISTRY: ${{ vars.ACR_REGISTRY }}
   IMAGE_NAME: no-weak-links
 
 permissions:
