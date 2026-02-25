@@ -66,6 +66,8 @@ jobs:
 
       - name: Install kubelogin
         uses: azure/use-kubelogin@v1
+        with:
+          kubelogin-version: 'v0.0.24'
 
       - name: Deploy with Helm
         run: |
