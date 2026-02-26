@@ -10,7 +10,7 @@ func main() {
 	r := gin.Default()
 
 	r.GET("/", func(c *gin.Context) {
-		c.String(200, "Hello, World! This is a simple Go application.")
+		c.String(200, "Hello, World! This is a simple Go application. [v2]")
 	})
 
 	r.GET("/health", func(c *gin.Context) {
