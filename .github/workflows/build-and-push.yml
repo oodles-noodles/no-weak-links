@@ -80,7 +80,7 @@ jobs:
 
       - name: Generate SBOM
         id: sbom
-        uses: anchore/sbom-action@v0.18.0
+        uses: anchore/sbom-action@v0.23.1
         with:
           image: ${{ vars.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
           artifact-name: sbom.spdx.json
